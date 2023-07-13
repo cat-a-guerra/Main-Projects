@@ -1,0 +1,718 @@
+---
+title: "Parkinson's Disease Classifier"
+author: "Catarina Guerra"
+date: "December 11, 2017"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=TRUE}
+
+# Get the dataset
+dataset <- read.csv('https://archive.ics.uci.edu/ml/machine-learning-databases/parkinsons/parkinsons.data')
+
+# Define feature and target variables
+features <- subset(dataset, select = -c(name, status))
+target <- subset(dataset, select = c(status)) 
+
+# Show number of samples of the dataset
+cat(sprintf("Number of dataset samples: %s\n", nrow(features)))
+
+```
+Given that this dataset has more than two quantitative dependent variables and a binary outcome variable, this project will aim to design a Logistic Regression model that most accurately classifies controls and Parkinson's Disease (PD) patients.
+
+<style>
+body {
+text-align: justify}
+</style>
+
+# Checking for outliers and missing values
+
+Now that the number of samples of the dataset is known, we will in first place check for the existence of missing values and outliers.
+
+```{r EDA, include=TRUE}
+
+# Get the number of missing values of the dataset
+cat(sprintf("Number of missing values in the dataset: %s\n", sum(which(is.na(features)))))
+
+# Vector describing all dataset features' names 
+feature_names <- c('MDVP_Fo_Hz', 'MDVP_Fhi_Hz', 'MDVP_Flo_Hz', 'MDVP_Jitter', 'MDVP_Jitter_Abs', 'MDVP_RAP', 'MDVP_PPQ', 'Jitter_DDP', 'MDVP_Shimmer', 'MDVP_Shimmer_dB', 'Shimmer_APQ3', 'Shimmer_APQ5', 'MDVP_APQ', 'Shimmer_DDA', 'NHR', 'HNR', 'RPDE', 'D2', 'DFA', 'spread1', 'spread2', 'PPE')
+
+# Rename columns of feature dataset
+colnames(features) <- feature_names
+
+# Matrix for the outer bound values
+bounds <- matrix(0, ncol(features), 4)
+
+# Maximum and minimum values of each feature
+feature_max <- apply(features,2,max)
+feature_min <- apply(features,2,min)
+
+# Populate the matrix with IQR, upper and lower bound, and the number of existing outliers for each feature
+for (x in 1:ncol(features)) {
+  iqr <- IQR(features[,x])
+  bounds[x,1] = quantile(features[,x],probs = c(0.25))-(iqr*1.5)
+  bounds[x,2] = quantile(features[,x],probs = c(0.75))+(iqr*1.5)
+  bounds[x,3] = sum(features[,x] < bounds[x,1])
+  bounds[x,4] = sum(features[,x] > bounds[x,2])
+}
+
+# Rename columns and rows of the matrix with the outer bound values
+colnames(bounds) <- c("lower bound", "upper bound", "# lower bound outliers", "# upper bound outliers")
+rownames(bounds) <- feature_names
+
+# Get the names and indexes of the features with no outliers
+no_outliers_feature_names <- rownames(subset(bounds, bounds[,"# lower bound outliers"]==0 & bounds[,"# upper bound outliers"]==0))
+no_outliers_indexes <- which(feature_names %in% no_outliers_feature_names)
+
+# Show the feature names which do not have outliers
+cat("Features with no outliers: {", noquote(paste(unlist(no_outliers_feature_names), collapse=', ')), "}", sep="")
+
+``` 
+
+Based on the results that were obtained, there are no missing values in this dataset and only 3 variables do not have outliers: "MDVP_Fo_Hz", "RPDE" and "D2". 
+
+
+# Check for multicollinearity
+
+Next, we will also check for multicollinearity, that is, if there is any correlation/dependence between predictors since it can cause overfitting, model instability and inaccuracy, as well as hinder feature importance and interpretation.
+As we did not know if there was any relationship between the variables, i.e., if it was monotonic, linear, or even non-linear, we thought that the best strategy would be to perform the distance correlation. A correlation matrix was then created based on this approach, and to better demonstrate the correlation between the dataset variables, we have plotted it in the following heatmap:
+
+```{r Distance Correlation Matrix, include=TRUE}
+
+# Create function for distance correlation
+distance_correlation <- function(x, y) {
+  n <- length(x)
+  A <- outer(x, x, "-")
+  B <- outer(y, y, "-")
+  
+  cov_AA <- cov(A)
+  cov_BB <- cov(B)
+  cov_AB <- cov(A, B)
+  
+  dcov <- sqrt(sum(cov_AA * cov_BB))
+  dcor <- sqrt(sum(cov_AB * cov_AB)) / dcov
+  
+  return(dcor)
+}
+
+# Create correlation matrix with the distance correlation results
+distance_matrix <- matrix(0, ncol(features), ncol(features))
+  
+# Store distance correlation results in the matrix
+for (i in 1:ncol(features)) {
+    for (j in 1:ncol(features)) {
+      distance_matrix[i,j] = distance_correlation(features[,i], features[,j])
+    }
+}
+
+# Rename columns and rows of the correlation matrix
+colnames(distance_matrix) <- feature_names
+rownames(distance_matrix) <- feature_names
+
+# Invoke corrplot library for the correlation matrix
+suppressMessages({library(corrplot)})
+
+# Show correlation matrix between variables
+corrplot(distance_matrix, method="color")
+
+```
+
+Based on the results of this correlation matrix, we can conclude that several features are strongly correlated, which, in turn, tells us that we are indeed facing a multicollinearity problem. 
+Given that this dataset contains both multicollinearity and outliers, we'll first address multicollinearity and its influence on the model, as relationships among predictors can influence outliers. By handling multicollinearity first, the reliability and interpretability of the model's coefficients can increase, allowing for more accurate identification and treatment of outliers.
+
+
+# Check for the influence of multicollinearity in the model
+
+As previously seen, the dataset has a large number of strongly correlated features. Therefore, in this section, we'll point them out and analyze their influence on some model performance metrics (Residual Variance, AIC, and ROC AUC) by removing one multicollinear feature at a time from our dataset. The feature selected for removal will be the one that leads to a model with the highest ROC AUC since this metric displays how well can a classification model distinguish classes. If multiple features yield the same maximum value, the tiebreaker will be the residual variance, as it quantifies the discrepancy between observed and predicted outcomes in a Logistic Regression model. The multicollinearity threshold used in this analysis was 0.80.
+Then, to see if multicollinearity affects the model, we will perform a likelihood-ratio test on the full dataset model and on the non-collinear features model to identify the most significant features in both models and whether they differ. To get more details that allow us to understand how this problem affects the model, we will calculate some performance metrics (Residual Variance, AIC, ROC AUC, F1-Score) and perform the Wald test for both models. Through the optimal trade-off of these metrics, we will determine whether a model without collinear features performs better than one with the full dataset. If that is the case, we will then strip those features out of the dataset.
+
+
+But to start this procedure, we must, in the first place, divide our data into two different groups: a training group (to fit the statistical model) and a test group (to test and validate the model). These are divided into a 70% / 30% proportion, respectively.
+
+
+## Training/Test groups
+
+```{r Training/Test sets, include=TRUE}
+
+# Sample training rows from the total number of rows
+training_rows <- sample(1:nrow(features), round(0.7*nrow(features)))
+
+# Retrieve test rows based on the remaining rows
+test_rows <- setdiff(1:nrow(features), training_rows)
+
+# Define the training and test target
+result_train <- target[,1][training_rows]
+result_test <- target[,1][test_rows]
+
+```
+
+
+## Multicollinear Features
+
+```{r Multicollinear Features, include=TRUE}
+
+# Invoke pROC library to estimate ROC AUC
+suppressMessages({library(pROC)})
+
+# Get the correlation matrix features and column indexes that have high-correlated values
+multicollinear_elements <- which(abs(distance_matrix) > 0.80 & abs(distance_matrix) < 1, arr.ind = TRUE) 
+multicollinear_features <- unique(c(rownames(distance_matrix)[multicollinear_elements], colnames(distance_matrix)[multicollinear_elements]))
+multicollinear_feature_indexes <- which(feature_names %in% multicollinear_features)
+
+# Define a function that returns a matrix with the Logistic Regression model metrics for every removed multicollinear feature 
+solve_multicollinearity <- function(feature_space, training_result, multicollinear_feature_indexes, multicollinear_features) {
+
+  # To suppress inconvenient warnings and messages
+  suppressMessages(suppressWarnings({
+
+    # Iterable row counter
+    row_counter <- 1
+    
+    # Create dataframe storing Logistic Regression model metrics per multicollinear feature removed
+    multicollinear_test <- data.frame(matrix(ncol = 4, nrow = length(multicollinear_feature_indexes)))
+    colnames(multicollinear_test) <- c("Feature removed", "Residual Deviance", "AIC", "ROC AUC")
+    
+    for (i in multicollinear_feature_indexes) {
+      
+      # Define the training set based on the removed feature
+      training_set <- subset(feature_space[training_rows,], select = -c(i)) 
+      
+      # Build the Logistic Regression model
+      log_reg <- glm(training_result ~ ., data = training_set, family=binomial())
+      predicted_outcome <- ifelse(predict(log_reg, feature_space[test_rows,], type="response") >= 0.5, 1, 0)
+      
+      # Store Logistic Regression model metrics and corresponding removed feature
+      multicollinear_test$"Feature removed"[row_counter] <- multicollinear_features[row_counter]
+      multicollinear_test$"Residual Deviance"[row_counter] <- log_reg$deviance
+      multicollinear_test$"AIC"[row_counter] <- log_reg$aic
+      multicollinear_test$"ROC AUC"[row_counter] <- roc(result_test, predicted_outcome)$auc[1]
+      
+      # Increment the row counter by iteration
+      row_counter <- row_counter + 1
+    }
+    return(multicollinear_test)
+  }))
+}
+
+
+# Create dataframe storing optimal Logistic Regression model metrics per iteration
+optimal_metric_iteration <- data.frame(matrix(ncol = 4, nrow = length(multicollinear_feature_indexes)))
+colnames(optimal_metric_iteration) <- c("Feature removed", "Residual Deviance", "AIC", "ROC AUC")
+
+# Initialize iterable versions of variables that will reduce its elements throughout the for loop
+subfeature_space <- features
+new_multicollinear_feature_indexes <- multicollinear_feature_indexes
+new_multicollinear_features <- multicollinear_features
+
+# Iterable row counter
+n <- 1
+
+# To suppress inconvenient warnings and messages
+suppressMessages(suppressWarnings({
+  for (j in new_multicollinear_feature_indexes) {
+  
+    # Get Logistic Regression model metrics
+    multicollinear_test_results <- solve_multicollinearity(subfeature_space, result_train, new_multicollinear_feature_indexes, new_multicollinear_features)
+  
+    # Get index of the feature to be removed from the set of multicollinear features - maximum ROC AUC
+    to_remove_multicollinear_index <- which(multicollinear_test_results[,4] == max(multicollinear_test_results[,4]))  
+    
+    # If there is more than one feature causing the ROC AUC maximum, get index of the feature with lower residual variance - tiebreak
+    if (length(to_remove_multicollinear_index)>1) {
+        to_remove_multicollinear_index <- which(multicollinear_test_results[to_remove_multicollinear_index,2] == min(multicollinear_test_results[to_remove_multicollinear_index,2]))
+    }
+  
+    # Store optimal Logistic Regression model metrics and corresponding removed feature per iteration
+    optimal_metric_iteration$"Feature removed"[n] <- multicollinear_test_results[to_remove_multicollinear_index, 1]
+    optimal_metric_iteration$"Residual Deviance"[n] <- multicollinear_test_results[to_remove_multicollinear_index, 2]
+    optimal_metric_iteration$"AIC"[n] <- multicollinear_test_results[to_remove_multicollinear_index, 3]
+    optimal_metric_iteration$"ROC AUC"[n] <- multicollinear_test_results[to_remove_multicollinear_index, 4]
+  
+    # Get index of the feature to be removed from the whole dataset - optimal metric trade-off
+    to_remove_distance_matrix_features <- multicollinear_features[multicollinear_features %in% optimal_metric_iteration$"Feature removed"[n]]
+      
+    # Update distance matrix and subfeature space by removing the multicollinear feature for the next iteration
+    distance_matrix <- distance_matrix[!(rownames(distance_matrix) %in% to_remove_distance_matrix_features), !(colnames(distance_matrix) %in% to_remove_distance_matrix_features)]
+    subfeature_space <- subfeature_space[, !(colnames(subfeature_space) %in% to_remove_distance_matrix_features)]
+  
+    # Update set of multicollinear features and indexes for the next iteration
+    new_multicollinear_elements <- which(abs(distance_matrix) > 0.85 & abs(distance_matrix) < 1, arr.ind = TRUE) 
+    new_multicollinear_features <- unique(c(rownames(distance_matrix)[new_multicollinear_elements], colnames(distance_matrix)[new_multicollinear_elements]))
+    new_multicollinear_feature_indexes <- which(feature_names %in% new_multicollinear_features)
+  
+    # Increment the row counter by iteration
+    n <- n + 1
+    
+    # Exit the loop when there are no more multicollinear features on the set
+    if (length(new_multicollinear_feature_indexes) == 0) {
+      break  
+    }
+  }
+}))
+
+cat("The dataset has ", sum(!is.na(optimal_metric_iteration[,1])), " multicollinear features, which are: {", noquote(paste(unlist(optimal_metric_iteration[which(!is.na(optimal_metric_iteration[, 1])),1]), collapse=', ')), "}", sep="")
+
+```
+
+
+## Likelihood-ratio test
+
+This test assesses whether adding or removing a set of parameters significantly improves the fit of a model since its null hypothesis states that the null model provides an adequate fit to the data and the additional parameters in the alternative model are not necessary. Thus, features with p-value < 0.05 allow us to reject the null hypothesis and therefore are significant to the model, providing a significantly better fit. It is based on the p-value of the feature set of both models that we will know which are the most significant features in each model and, consequently, analyze if they differ from each other.
+
+```{r Likelihood-ratio test - Multicollinearity, include=TRUE}
+
+# To suppress inconvenient warnings and messages
+suppressWarnings({
+  
+  # Get the Logistic regression model for the complete dataset and the no-collinear dataset
+  complete_log_reg <- glm(result_train ~ ., data = features[training_rows,], family=binomial())
+  no_multicollinear_log_reg <- glm(result_train ~ ., data = subfeature_space[training_rows,], family=binomial())
+
+  # Perform the Likelihood-ratio test for both models
+  complete_chi_sqr_gof <- anova(complete_log_reg, test = "Chisq")
+  no_multicollinear_chi_sqr_gof <- anova(no_multicollinear_log_reg, test = "Chisq")
+})
+
+# Get the most significant features for both models
+complete_significant_features <- rownames(complete_chi_sqr_gof[which(complete_chi_sqr_gof[,"Pr(>Chi)"]<0.05),])
+no_multicollinear_significant_features <- rownames(no_multicollinear_chi_sqr_gof[which(no_multicollinear_chi_sqr_gof[,"Pr(>Chi)"]<0.05),])
+
+
+# Print message according to the results and defines flag for upcoming testing
+
+# If the significant features of the models are exactly the same
+if(identical(complete_significant_features, no_multicollinear_significant_features)==TRUE){
+  multicollinear_flag <- FALSE                                            
+  cat("The multicollinear features do not affect the significant predictors of the model.", "\n\n")
+} else{
+  multicollinear_flag <- TRUE
+  cat("The multicollinear features affect the significant predictors of the model.", "\n\n")
+  
+  # If each model has different significant features
+  if(length(setdiff(no_multicollinear_significant_features, complete_significant_features))>0 & length(setdiff(complete_significant_features, no_multicollinear_significant_features))>0){
+        cat("Significant features of the no-collinear dataset not existing in the complete dataset: {", noquote(paste(unlist(setdiff(no_multicollinear_significant_features, complete_significant_features)), collapse=', ')), "}", "\n", sep="")
+        cat("Significant features of the complete dataset not existing in the no-collinear dataset: {", noquote(paste(unlist(setdiff(complete_significant_features, no_multicollinear_significant_features)), collapse=', ')), "}", "\n", sep="")
+  } else {
+    if(length(setdiff(no_multicollinear_significant_features, complete_significant_features))>0){
+      cat("Significant features of the no-collinear dataset not existing in the complete dataset: {", noquote(paste(unlist(setdiff(no_multicollinear_significant_features, complete_significant_features)), collapse=', ')), "}", "\n", sep="")
+    } else {
+      cat("Significant features of the complete dataset not existing in the no-collinear dataset: {", noquote(paste(unlist(setdiff(complete_significant_features, no_multicollinear_significant_features)), collapse=', ')), "}", "\n", sep="")
+    }
+  }    
+}
+
+# Get matching significant features
+cat("The two datasets have the following significant features in common: {", noquote(paste(unlist(intersect(complete_significant_features, no_multicollinear_significant_features)), collapse=', ')), "}", sep="")
+
+```
+
+
+## Multicollinearity on Model Performance
+
+```{r Model Performance - Multicollinearity, include=TRUE}
+
+# Invoke caret and aod libraries to estimate F1-Score and perform Wald test
+suppressWarnings(suppressMessages({
+  library(caret)
+  library(aod)
+}))
+
+# Create function that returns the model performance metrics assessed
+performance_metrics <- function(model, feature_space) {
+  
+  # Get Residual Deviance and AIC
+  residual_deviance <- model$deviance
+  aic <- model$aic
+  
+  # Get predicted outcome
+  predicted_outcome <- ifelse(predict(model, feature_space[test_rows,], type="response") >= 0.5, 1, 0)
+  
+  # Estimate the ROC AUC
+  roc_auc <- roc(result_test, predicted_outcome)$auc[1]
+  
+  # Convert predicted_outcome and status_test to factors with the same levels to ensure we've able to estimate the F1-Score
+  predicted_outcome_factorized <- factor(predicted_outcome, levels = c("0", "1"))
+  result_test_factorized <- factor(result_test, levels = c("0", "1"))
+  
+  # Estimate the F1-Score
+  f1_score <- confusionMatrix(predicted_outcome_factorized, result_test_factorized, mode = "everything", positive="1")$byClass['F1']
+  
+  # Perform the Wald test
+  p_value_wald <- wald.test(b=coef(model), Sigma = vcov(model), Terms=1:2)$result$chi2[3]
+  
+  return(c(residual_deviance, aic, roc_auc, f1_score, p_value_wald))
+}
+
+
+# Define a matrix that stores performance metrics for the complete dataset and no-collinear feature dataset models
+multicollinear_performance <- data.frame(matrix(ncol = 5, nrow = 2))
+colnames(multicollinear_performance) <- c("Residual Deviance", "AIC", "ROC AUC", "F1-Score", "Wald test p-value")
+rownames(multicollinear_performance) <- c("Full feature space", "Only no-collinear features")
+
+# To suppress inconvenient warnings and messages
+suppressMessages({
+
+  # Store the performance metrics for both models
+  multicollinear_performance[1,] <- performance_metrics(complete_log_reg, features)
+  multicollinear_performance[2,] <- performance_metrics(no_multicollinear_log_reg, subfeature_space)
+})
+
+# Print the performance metrics of both models
+for (k in 1:2) {
+    if(k==1){
+      type <- "**Full feature space model**"
+    }
+    else{
+      type <- "**No-collinear features model**"
+    }
+
+    cat(type, "\n", 
+    "  - Residual Deviance: ", multicollinear_performance[k,1], "\n", 
+    "  - AIC: ", multicollinear_performance[k,2], "\n",
+    "  - ROC AUC: ", multicollinear_performance[k,3], "\n",
+    "  - F1-Score: ", multicollinear_performance[k,4], "\n",
+    "  - Wald test p-value: ", multicollinear_performance[k,5], "\n\n", sep="")
+}
+
+# Create a function that returns an explanation of the results and defines the status for the test's final conclusion based on the performance metrics of two models 
+## Flag explanation - TRUE = Final model has better performance; FALSE = Original model has better performance
+print_explanation <- function(performance, original_model, final_model) {
+  if(performance[1,1] > performance[2,1]){
+    residual_deviance_flag <- TRUE 
+    residual_deviance <- paste("Based on these results, we can observe that the residual deviance of the ", original_model, " (", round(performance[1,1], digits=5), ") is higher than the one from the ", final_model, " (", round(performance[2,1], digits=5), "), which means that the ", original_model, " is fitted worse to the data than the ", final_model, ".", sep='')
+  } else {
+    residual_deviance_flag <- FALSE 
+    residual_deviance <- paste("Based on these results, we can observe that the residual deviance of the ", final_model, " (", round(performance[2,1], digits=5), ") is higher than the one from the ", original_model, " (", round(performance[1,1], digits=5), "), which means that the ", final_model, " is fitted worse to the data than the ", original_model, ".", sep='')
+  }
+  if(performance[1,2] > performance[2,2]){
+    aic_flag <- TRUE
+    aic <- paste("Then, we can check that the ", original_model, " (", round(performance[1,2], digits=5), ") has a higher AIC than the ", final_model, " (", round(performance[2,2], digits=5), "), meaning that the latter has a higher balance between complexity and explanatory power than the former, i.e., it is a better-fitting model that explains the data adequately.", sep='')
+  } else {
+    aic_flag <- FALSE
+    aic <- paste("Then, we can check that the ", final_model, " (", round(performance[2,2], digits=5), ") has a higher AIC than the ", original_model, " (", round(performance[1,2], digits=5), "), meaning that the latter has a higher balance between complexity and explanatory power than the former, i.e., it is a better-fitting model that explains the data adequately.", sep='')
+  }
+  if(performance[1,3] > performance[2,3]){
+    roc_auc_flag <- FALSE
+    roc_auc <- paste("Regarding the ROC AUC, we can notice that it is higher in the ", original_model, " (", round(performance[1,3], digits=5), ") than in the ", final_model, " (", round(performance[2,3], digits=5), "), which indicates us that the ", original_model, " better discriminates between positive and negative instances than the ", final_model, " and therefore has better overall performance.", sep='')
+  } else if(performance[1,3] == performance[2,3]){
+    roc_auc_flag <- TRUE
+    roc_auc <- paste("Regarding the ROC AUC, we can notice that both models have the same value: ", original_model, " (", round(performance[1,3], digits=5), ") ; ", final_model, " (", round(performance[2,3], digits=5), "), which indicates us that the models exhibit a comparable ability to differentiate between the positive and negative instances and therefore do not have a significant difference in their predictive performance.", sep='')
+  } else {
+    roc_auc_flag <- TRUE
+    roc_auc <- paste("Regarding the ROC AUC, we can notice that it is higher in the ", final_model, " (", round(performance[2,3], digits=5), ") than in the ", original_model, " (", round(performance[1,3], digits=5), "), which indicates us that the ", final_model, " better discriminates between positive and negative instances than the ", original_model, " and therefore has better overall performance.", sep='')
+  }
+  if(performance[1,4] > performance[2,4]){
+    f1_score_flag <- FALSE
+    f1_score <- paste("Furthermore, by examining the F1-Score, we can identify that it is higher in the ", original_model, " (", round(performance[1,4], digits=5), ") than in the ", final_model, " (", round(performance[2,4], digits=5), "), which displays that the former has higher accuracy in minimizing false positives and minimizing false negatives than the latter, thus being a better-performing model.", sep='')
+  } else if(performance[1,4] == performance[2,4]){
+    f1_score_flag <- TRUE
+    f1_score <- paste("Furthermore, by examining the F1-Score, we can identify that both models have the same value: ", original_model, " (", round(performance[1,4], digits=5), ") ; ", final_model, " (", round(performance[2,4], digits=5), "), which displays that the models have achieved a similar balance between minimizing false positives and minimizing false negatives, thus no significant differences in the model performances can be found.", sep='')
+  } else {
+    f1_score_flag <- TRUE
+    f1_score <- paste("Furthermore, by examining the F1-Score, we can identify that it is higher in the ", final_model, " (", round(performance[2,4], digits=5), ") than in the ", original_model, " (", round(performance[1,4], digits=5), "), which displays that the former has higher accuracy in minimizing false positives and minimizing false negatives than the latter, thus being a better-performing model.", sep='')
+  }
+  if(performance[1,5] > performance[2,5]){
+    p_value_wald_flag <- TRUE
+    if(performance[1,5]<0.05){
+      p_value_wald <- paste("Lastly, upon consulting the results for the Wald test, as both p-values are lower than 0.05 (", original_model, " p-value = ", round(performance[1,5], digits=5), " ; ", final_model, " p-value = ", round(performance[2,5], digits=5), "), we can conclude that the null hypothesis (predictor variable does not affect the outcome variable) can be rejected for both sets of features, which thus means that they are statistically significant for its corresponding model fit. Nevertheless, ", sep='') 
+    }
+    else if (performance[2,5]>0.05){
+      p_value_wald <- paste("Lastly, upon consulting the results for the Wald test, as both p-values are higher than 0.05 (", original_model, " p-value = ", round(performance[1,5], digits=5), " ; ", final_model, " p-value = ", round(performance[2,5], digits=5), "), we can conclude that the null hypothesis (predictor variable does not affect the outcome variable) does not have evidence to be rejected for both sets of features, which thus means that they are not statistically significant for its corresponding model fit. Furthermore, ", sep='') 
+    } 
+    else if (performance[1,5]>0.05 & performance[2,5]<0.05){
+      p_value_wald <- paste("Lastly, upon consulting the results for the Wald test, as the p-value for the feature set of the ", final_model, ", is lower than 0.05 (p-value = ", round(performance[2,5], digits=5), "), we can conclude that the null hypothesis (predictor variable does not affect the outcome variable) can be rejected for that feature set, which thus means that it is statistically significant for its corresponding model fit. The same conclusion cannot be drawn for the feature set of the ", original_model, ", given that its p-value is higher than 0.05 (p-value = ", round(performance[1,5], digits=5), "), from which we can claim that the null hypothesis does not have evidence to be rejected, and thus, those features are not statistically significant for its model fit. Furthermore, ", sep='') 
+    } 
+    p_value_wald <- paste(p_value_wald, "since the p-value is higher in the feature set of the ", original_model, " (", round(performance[1,5], digits=5), ") than in the feature set of the ", final_model, " (", round(performance[2,5], digits=5), "), we can state that the feature set used in the former is less statistically significant than the one used in the latter, therefore demonstrating that the model fit is better in the ", final_model, ".", sep='')   
+  } else {
+    p_value_wald_flag <- FALSE
+    if(performance[2,5]<0.05){
+      p_value_wald <- paste("Lastly, upon consulting the results for the Wald test, as both p-values are lower than 0.05 (", original_model, " p-value = ", round(performance[1,5], digits=5), " ; ", final_model, " p-value = ", round(performance[2,5], digits=5), "), we can conclude that the null hypothesis (predictor variable does not affect the outcome variable) can be rejected for both sets of features, which thus means that they are statistically significant for its corresponding model fit. Nevertheless, ", sep='') 
+    }
+    else if (performance[1,5]>0.05){
+      p_value_wald <- paste("Lastly, upon consulting the results for the Wald test, as both p-values are higher than 0.05 (", original_model, " p-value = ", round(performance[1,5], digits=5), " ; ", final_model, " p-value = ", round(performance[2,5], digits=5), "), we can conclude that the null hypothesis (predictor variable does not affect the outcome variable) does not have evidence to be rejected for both sets of features, which thus means that they are not statistically significant for its corresponding model fit. Furthermore, ", sep='') 
+    } 
+    else if (performance[2,5]>0.05 & performance[1,5]<0.05){
+      p_value_wald <- paste("Lastly, upon consulting the results for the Wald test, as the p-value for the feature set of the ", original_model, ", is lower than 0.05 (p-value = ", round(performance[1,5], digits=5), "), we can conclude that the null hypothesis (predictor variable does not affect the outcome variable) can be rejected for that feature set, which thus means that it is statistically significant for its corresponding model fit. The same conclusion cannot be drawn for the feature set of the ", final_model, ", given that its p-value is higher than 0.05 (p-value = ", round(performance[2,5], digits=5), "), from which we can claim that the null hypothesis does not have evidence to be rejected, and thus, those features are not statistically significant for its model fit. Furthermore, ", sep='') 
+    } 
+    p_value_wald <- paste(p_value_wald, "since the p-value is higher in the feature set of the ", final_model, " (", round(performance[2,5], digits=5), ") than in the feature set of the ", original_model, " (", round(performance[1,5], digits=5), "), we can state that the feature set used in the former is less statistically significant than the one used in the latter, therefore demonstrating that the model fit is better in the ", original_model, ".", sep='')
+  }
+
+  # Get the most frequent flag result to define the test conclusion 
+  conclusion <- table(c(residual_deviance_flag, aic_flag, roc_auc_flag, f1_score_flag, p_value_wald_flag))
+  result_flag <- as.logical(names(conclusion)[which.max(conclusion)])
+
+  return(c(residual_deviance, aic, roc_auc, f1_score, p_value_wald, result_flag))
+}
+
+# Get summary of the results
+multicollinear_result_summary <- print_explanation(multicollinear_performance, "full feature space model", "no-collinear features model")
+
+# Print the remarks of the analysis
+cat("** MULTICOLLINEARITY EFFECT ON MODEL PERFORMANCE **", "\n\n", 
+    noquote(unlist(multicollinear_result_summary[1])), "\n", 
+    noquote(unlist(multicollinear_result_summary[2])), "\n", 
+    noquote(unlist(multicollinear_result_summary[3])), "\n", 
+    noquote(unlist(multicollinear_result_summary[4])), "\n", 
+    noquote(unlist(multicollinear_result_summary[5])), "\n\n", sep="")
+
+# Print analysis conclusion and define flag variables for the following analysis
+if(multicollinear_result_summary[6]==TRUE){
+  multicollinear_flag <- TRUE
+  cat("In short, considering the gathered findings, the no-collinear features model is better fitted to the data than the full feature space model. Thus, collinear features should be removed, and the newly elected feature space is the no-collinear dataset.")
+} else{
+  multicollinear_flag <- FALSE
+  cat("In short, considering the gathered findings, the full feature space model is better fitted to the data than the no-collinear features model. Thus, collinear features should be kept, and the current feature space model continues to be the elected feature space.")
+}
+
+```
+
+
+# Check for the influence of outliers in the model
+
+As previously stated, based on its dataset's characteristics, this project aimed to design a Logistic Regression model. Usually, Logistic Regression models are robust to the presence of outliers. Nevertheless, we are going to test whether removing outliers will give us a more accurate and better-fitted model. To do so, we will follow a similar approach to the one done to check the multicollinearity influence in the model. 
+So, to see if the outliers affect the model, we will perform a likelihood-ratio test on the current feature space model and on the no-outlier features model to identify the most significant features in both models and whether they differ. To get more details that allow us to understand how this problem affects the model, we will calculate some performance metrics (Residual Variance, AIC, ROC AUC, F1-Score) and perform the Wald test for both models. Through the optimal trade-off of these metrics, we will determine whether a model without outlier features performs better than one with the current dataset. If that is the case, we will then strip those features out of the dataset.
+
+
+## Likelihood-ratio test
+
+```{r Likelihood-ratio test - Outliers, include=TRUE}
+
+# Define the feature space and the logistic regression model based on the influence of the multicollinearity
+if(multicollinear_flag==FALSE){
+    feature_space <- features
+    log_reg <- complete_log_reg
+    significant_features <- complete_significant_features
+    chi_sqr_gof <- complete_chi_sqr_gof
+} else{
+    feature_space <- subfeature_space
+    log_reg <- no_multicollinear_log_reg
+    significant_features <- no_multicollinear_significant_features
+    chi_sqr_gof <- no_multicollinear_chi_sqr_gof
+}
+
+# Get features with no outliers
+no_outliers_feature_space <- subset(feature_space, select = c(feature_names[no_outliers_indexes])) 
+
+# To suppress inconvenient warnings and messages
+suppressWarnings({
+
+  # Get the Logistic regression model for the feature set with no outliers
+  no_outliers_log_reg <- glm(result_train ~ ., data = no_outliers_feature_space[training_rows,], family=binomial())
+
+  # Perform the Likelihood-ratio test for the no-outlier model
+  no_outliers_chi_sqr_gof <- anova(no_outliers_log_reg, test = "Chisq")
+})
+
+# Get the most significant features for the no-outlier model
+no_outliers_significant_features <- rownames(no_outliers_chi_sqr_gof[which(no_outliers_chi_sqr_gof[,"Pr(>Chi)"]<0.05),])
+
+
+# Print message according to the results and defines flag for upcoming testing
+
+# If the significant features of the models are exactly the same
+if(identical(significant_features, no_outliers_significant_features)==TRUE){
+  outlier_flag <- FALSE                                            
+  cat("The outlier features do not affect the significant predictors of the model.", "\n\n")
+} else{
+  outlier_flag <- TRUE
+  cat("The outlier features affect the significant predictors of the model.", "\n\n")
+  
+  # If each model has different significant features
+  if(length(setdiff(no_outliers_significant_features, significant_features))>0 & length(setdiff(significant_features, no_outliers_significant_features))>0){
+        cat("Significant features of the no-outlier dataset not existing in the current dataset: {", noquote(paste(unlist(setdiff(no_outliers_significant_features, significant_features)), collapse=', ')), "}", "\n", sep="")
+        cat("Significant features of the current dataset not existing in the no-outlier dataset: {", noquote(paste(unlist(setdiff(significant_features, no_outliers_significant_features)), collapse=', ')), "}", "\n", sep="")
+  } else {
+    if(length(setdiff(no_outliers_significant_features, significant_features))>0){
+      cat("Significant features of the no-outlier dataset not existing in the current dataset: {", noquote(paste(unlist(setdiff(no_outliers_significant_features, significant_features)), collapse=', ')), "}", "\n", sep="")
+    } else {
+      cat("Significant features of the current dataset not existing in the no-outlier dataset: {", noquote(paste(unlist(setdiff(significant_features, no_outliers_significant_features)), collapse=', ')), "}", "\n", sep="")
+    }
+  }    
+}
+
+# Get matching significant features
+cat("The two datasets have the following significant features in common: {", noquote(paste(unlist(intersect(significant_features, no_outliers_significant_features)), collapse=', ')), "}", sep="")
+
+```
+
+
+## Outliers on Model Performance
+
+```{r Model Performance - Outlier, include=TRUE}
+
+# Define a matrix that stores performance metrics for the current and the no-outlier models
+outlier_performance <- data.frame(matrix(ncol = 5, nrow = 2))
+colnames(outlier_performance) <- c("Residual Deviance", "AIC", "ROC AUC", "F1-Score", "Wald test p-value")
+rownames(outlier_performance) <- c("Current feature space", "Only no-outlier features")
+
+# To suppress inconvenient warnings and messages
+suppressMessages({
+
+  # Store the performance metrics for both models
+  outlier_performance[1,] <- performance_metrics(log_reg, feature_space)
+  outlier_performance[2,] <- performance_metrics(no_outliers_log_reg, no_outliers_feature_space)
+})
+
+# Print the performance metrics of both models
+for (k in 1:2) {
+    if(k==1){
+      type <- "**Current feature space model**"
+    }
+    else{
+      type <- "**No-outlier features model**"
+    }
+
+    cat(type, "\n", 
+    "  - Residual Deviance: ", outlier_performance[k,1], "\n", 
+    "  - AIC: ", outlier_performance[k,2], "\n",
+    "  - ROC AUC: ", outlier_performance[k,3], "\n",
+    "  - F1-Score: ", outlier_performance[k,4], "\n",
+    "  - Wald test p-value: ", outlier_performance[k,5], "\n\n", sep="")
+}
+
+# Get summary of the results
+no_outliers_result_summary <- print_explanation(outlier_performance, "current feature space model", "no-outlier features model")
+
+# Print the remarks of the analysis
+cat("** OUTLIER EFFECT ON MODEL PERFORMANCE **", "\n\n", 
+    noquote(unlist(no_outliers_result_summary[1])), "\n", 
+    noquote(unlist(no_outliers_result_summary[2])), "\n", 
+    noquote(unlist(no_outliers_result_summary[3])), "\n", 
+    noquote(unlist(no_outliers_result_summary[4])), "\n", 
+    noquote(unlist(no_outliers_result_summary[5])), "\n\n", sep="")
+
+# Print analysis conclusion and define flag variables for the following analysis
+if(no_outliers_result_summary[6]==TRUE){
+  outlier_flag <- TRUE
+  cat("In short, bearing in mind the gathered observations, the no-outlier features model is better fitted to the data than the current feature space model. Thus, features with outliers should be removed, and the new elected feature space is the no-outlier dataset.")
+} else{
+  outlier_flag <- FALSE
+  cat("In short, bearing in mind the gathered observations, the current feature space model is better fitted to the data than the no-outlier features model. Thus, features with outliers should be kept, and the current feature space model continues to be the elected feature space.")
+}
+
+```
+
+
+# Model performance - Most significant features
+
+After understanding the impacts that multi-collinearity and the presence of outliers have on the model, we can then proceed to the last analysis of the project: assessing whether the model performs better with only significant features or with all variables of the current feature subspace. To do this, we will follow a similar procedure as in the previous section.
+So, to see if the most significant features affect the model's performance, we will calculate some performance metrics (Residual Variance, AIC, ROC AUC, F1-Score) and perform the Wald test for both models. Through the optimal trade-off of these metrics, we will determine whether a model with only significant features performs better than one from the current dataset. If that is the case, we will then strip the least significant features out of the dataset.
+From this outcome, we then have our final logistic regression model. 
+
+```{r Model Performance - Most significant features, include=TRUE}
+
+# Define the feature space and the logistic regression model based on the influence of the outlier features
+if(outlier_flag==FALSE){
+    feature_space <- subfeature_space
+    log_reg <- log_reg
+    significant_features <- significant_features
+} else{
+    feature_space <- no_outliers_feature_space
+    log_reg <- no_outliers_log_reg
+    significant_features <- no_outliers_significant_features
+}
+
+# Get features with only significant features
+significant_feature_space <- feature_space[, c(significant_features)]
+
+# Define a matrix that stores performance metrics for the current and only significant features models
+significant_performance <- data.frame(matrix(ncol = 5, nrow = 2))
+colnames(significant_performance) <- c("Residual Deviance", "AIC", "ROC AUC", "F1-Score", "Wald test p-value")
+rownames(significant_performance) <- c("Current feature space", "Only significant features")
+
+# Build the Logistic Regression model for the dataset with only significant features
+significant_log_reg <- glm(result_train ~ ., data = significant_feature_space[training_rows,], family=binomial())
+
+# Store the performance metrics for both models
+suppressMessages({
+      significant_performance[1,] <- performance_metrics(log_reg, feature_space)
+      significant_performance[2,] <- performance_metrics(significant_log_reg, significant_feature_space)
+})
+
+# Print the performance metrics of both models
+for (k in 1:2) {
+    if(k==1){
+      type <- "**Current feature space model**"
+    }
+    else{
+      type <- "**Significant feature space model**"
+    }
+
+    cat(type, "\n", 
+    "  - Residual Deviance:", significant_performance[k,1], "\n", 
+    "  - AIC:", significant_performance[k,2], "\n",
+    "  - ROC AUC:", significant_performance[k,3], "\n",
+    "  - F1-Score:", significant_performance[k,4], "\n",
+    "  - Wald test p-value:", significant_performance[k,5], "\n\n", sep="")
+}
+
+# Get summary of the results
+significant_result_summary <- print_explanation(significant_performance, "current feature space model", "significant feature space model")
+
+# Print the remarks of the analysis
+cat("** SIGNIFICANT FEATURES' EFFECT ON MODEL PERFORMANCE **", "\n\n", 
+    noquote(unlist(significant_result_summary[1])), "\n", 
+    noquote(unlist(significant_result_summary[2])), "\n", 
+    noquote(unlist(significant_result_summary[3])), "\n", 
+    noquote(unlist(significant_result_summary[4])), "\n", 
+    noquote(unlist(significant_result_summary[5])), "\n\n", sep="")
+
+# Print analysis conclusion
+if(significant_result_summary[6]==TRUE){
+  significant_flag <- TRUE
+  cat("In short, bearing in mind the gathered observations, the significant feature space model is better fitted to the data than the current feature space model. Thus, no-significant features should be removed, and the final feature space is the significant feature subspace.")
+} else{
+  significant_flag <- FALSE
+  cat("In short, bearing in mind the gathered observations, the current feature space model is better fitted to the data than the significant feature space model. Thus, no-significant features should be kept, and the final feature space model continues to be the current feature space.")
+}
+
+```
+
+
+# Final Logistic Regression Model
+
+In this last section, we will present the optimal Logistic Regression model, that was estimated based on the provided dataset, as well as some of its characteristics. 
+
+```{r Final Logistic Regression model, include=TRUE}
+
+# Define final model and feature space based on the analysis results
+if(significant_flag==TRUE){
+  final_feature_space <- significant_feature_space
+  final_log <- significant_log_reg
+  k <- 2
+} else{
+  final_feature_space <- feature_space
+  final_log <- log_reg
+  k <- 1
+}
+
+
+# Create equation string for showcase purposes
+
+# First instance (intercept)
+final_equation <- final_log$coefficients[1]
+
+# Add remaining elements of the sum 
+for(c in 2:length(final_log$coefficients)){
+  final_equation <- noquote(paste(final_equation," + ", "(", noquote(names(final_log$coefficients))[c], " * ", round(final_log$coefficients[c], digits=5), ")", sep=''))
+}
+
+# Set final format of the final Linear Regression model equation
+final_equation <- noquote(paste("ln(p/(1-p)) = ", final_equation, sep=''))
+
+cat("** FINAL LOGISTIC REGRESSION MODEL **", "\n\n", 
+    "Feature number: ", dim(final_feature_space)[2], "\n", 
+    "Feature names: {", noquote(paste(unlist(names(final_feature_space)), collapse=', ')), "}", "\n\n", 
+    "Model equation: ", final_equation, "\n\n", 
+    "Model performance:", "\n", 
+    "  - Residual Deviance: ", significant_performance[k,1], "\n", 
+    "  - AIC: ", significant_performance[k,2], "\n",
+    "  - ROC AUC: ", significant_performance[k,3], "\n",
+    "  - F1-Score: ", significant_performance[k,4], "\n",
+    "  - Wald test p-value: ", significant_performance[k,5], sep="")
+
+```
+
+Based on these values, we can conclude that the estimated model has fairly good predictive power, enabling a robust detection of Parkinson's Disease cases solely based on these features.
